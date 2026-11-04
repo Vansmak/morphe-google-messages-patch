@@ -1,0 +1,1089 @@
+### patcher docs
+1_patcher_intro.md
+2_1_setup.md
+2_2_1_fingerprinting.md
+2_2_patch_anatomy.md
+2_patches_intro.md
+3_structure_and_conventions.md
+4_apis.md
+5_patcher_changes.md
+README.md
+### doc mentions
+/tmp/mp-patcher/docs/2_2_patch_anatomy.md:39:    dependsOn(disableAdsResourcePatch)
+/tmp/mp-patcher/docs/2_2_patch_anatomy.md:179:val prepareExtensionsPatch = resourcePatch {
+/tmp/mp-patcher/docs/5_patcher_changes.md:10:Only the manifest is decoded up front. Other files are decoded when read with `get()` or `document()`.
+/tmp/mp-patcher/docs/5_patcher_changes.md:17:decode("res/values*/strings.xml").forEach { path -> document(path).use { /* ... */ } }
+/tmp/mp-patcher/docs/4_apis.md:10:4. 📃 Read and write DOM files using `document(String)` and  `document(InputStream)`
+/tmp/mp-patcher/docs/4_apis.md:114:#### 📃 `document(String)`  and  `document(InputStream)`
+/tmp/mp-patcher/docs/4_apis.md:120:    document("res/values/strings.xml").use { document ->
+/tmp/mp-patcher/docs/4_apis.md:134:    document(inputStream).use { document ->
+/tmp/mp-patcher/docs/4_apis.md:163:- A file a patch reads by its path, with `get(String, Boolean)` or `document(String)`, is decoded then.
+/tmp/mp-patcher/docs/4_apis.md:176:        document(path).use { document ->
+/tmp/mp-patcher/docs/2_patches_intro.md:11:- A `ResourcePatch` modifies decoded resources.
+/tmp/mp-patcher/docs/2_patches_intro.md:12:- A `RawResourcePatch` modifies arbitrary files.
+/tmp/mp-patcher/docs/2_patches_intro.md:22:to modify the Dalvik VM bytecode, while the `ResourcePatchContext` provides APIs to modify resources.
+/tmp/mp-patcher/docs/2_patches_intro.md:24:The difference between `ResourcePatch` and `RawResourcePatch` is that Morphe Patcher will decode the resources
+/tmp/mp-patcher/docs/2_patches_intro.md:25:if it is supplied a `ResourcePatch` for execution or if any patch depends on a `ResourcePatch`
+/tmp/mp-patcher/docs/2_patches_intro.md:26:and will not decode the resources before executing `RawResourcePatch`.
+/tmp/mp-patcher/docs/2_patches_intro.md:27:Both `ResourcePatch` and `RawResourcePatch` can modify arbitrary files in the APK,
+/tmp/mp-patcher/docs/2_patches_intro.md:28:whereas only `ResourcePatch` can modify decoded resources. The choice of which type to use depends on the use case.
+/tmp/mp-patcher/docs/2_patches_intro.md:30:so if the patch does not need to modify decoded resources, it is better to use `RawResourcePatch` or `BytecodePatch`.
+/tmp/mp-patcher/docs/2_patches_intro.md:45:val rawResourcePatch = rawResourcePatch {
+/tmp/mp-patcher/docs/2_patches_intro.md:52:val resourcePatch = resourcePatch {
+### ResourcePatchContext.kt
+/*
+ * Copyright 2026 Morphe.
+ * https://github.com/MorpheApp/morphe-patcher
+ *
+ * Original forked code:
+ * https://github.com/LisoUseInAIKyrios/revanced-patcher
+ */
+
+package app.morphe.patcher.patch
+
+import app.morphe.patcher.InternalApi
+import app.morphe.patcher.PackageMetadata
+import app.morphe.patcher.PatcherBehavior
+import app.morphe.patcher.PatcherConfig
+import app.morphe.patcher.PatcherResult
+import app.morphe.patcher.apk.CompressedDexFiles
+import app.morphe.patcher.logging.PhaseTimings
+import app.morphe.patcher.resource.ResourceIds
+import app.morphe.patcher.resource.ResourceMode
+import app.morphe.patcher.resource.coder.ArsclibResourceCoder
+import app.morphe.patcher.resource.coder.ResourceCoder
+import app.morphe.patcher.util.Document
+import java.io.Closeable
+import java.io.File
+import java.io.InputStream
+import java.util.logging.Logger
+
+
+/**
+ * A context for patches containing the current state of resources.
+ *
+ * Resources are decoded when patches request them, instead of all before patches execute. The manifest
+ * is always decoded. A file a patch reads by its path with [get] or [document] is decoded then, and
+ * [decode] decodes every file matching a pattern, which a patch that lists a directory must call first,
+ * since a directory only holds the files decoded so far.
+ * [listDecodableFiles] lists what can be decoded without decoding it.
+ */
+class ResourcePatchContext internal constructor(
+    private val config: PatcherConfig,
+) : PatchContext<PatcherResult.PatchedResources>, Closeable {
+    private val logger = Logger.getLogger(ResourcePatchContext::class.java.name)
+
+    override val fileWorkspace = config.fileWorkspace
+
+    override val validate = config.validate
+
+    private val resourceCoder: ResourceCoder = ArsclibResourceCoder(config.apkFiles, config.apkFile, config.keepArchitectures)
+
+    /**
+     * The resource ids of the APK being patched, read from its resource table on first use.
+     * It is also reachable without a context through [app.morphe.patcher.resource.resourceId] and
+     * [app.morphe.patcher.resource.hasResourceId], which is what [app.morphe.patcher.resourceLiteral] uses.
+     */
+    val resourceIds: ResourceIds = ResourceIds { resourceCoder.resourceIds() }.also { ResourceIds.current = it }
+
+    val packageMetadata = resourceCoder.getPackageMetadata()
+
+    /**
+     * Read a document from an [InputStream].
+     */
+    @Suppress("unused")
+    fun document(inputStream: InputStream) = Document(inputStream)
+
+    /**
+     * Read and write documents in the [PatcherConfig.apkFiles].
+     * The file is decoded first if it is not decoded yet.
+     */
+    @Suppress("unused")
+    fun document(path: String) = Document(resourceCoder.getFile(path))
+    @Suppress("unused")
+    fun document(path: String, packageName: String) = Document(resourceCoder.getFile(path, packageName))
+
+    /**
+     * Decode resources of [PatcherConfig.apkFile].
+     *
+     * @param mode The [ResourceMode] to use.
+     */
+    internal fun decodeResources(mode: ResourceMode): PackageMetadata {
+        config.initializeTemporaryFilesDirectories()
+        val onRequest = config.uses(PatcherBehavior.ON_REQUEST_RESOURCE_DECODING)
+        if (mode == ResourceMode.FULL) {
+            logger.info(if (onRequest) "Decoding the manifest" else "Decoding all resources")
+            return resourceCoder.decodeResources(onRequest)
+        } else {
+            logger.info(if (onRequest) "Extracting raw resources on request" else "Decoding resources in raw mode")
+            return resourceCoder.decodeRaw(onRequest)
+        }
+    }
+
+    /**
+     * Called once patches no longer request resources, which releases the resource table on small heaps
+     * before the DEX files are written.
+     */
+    internal fun finishDecoding() = resourceCoder.finishDecoding()
+
+    /**
+     * Whether the resource APK [get] writes leaves out an archive entry, as the patched APK replaces or
+     * deletes it. Set once the DEX files are written.
+     */
+    internal var omitEntry: (String) -> Boolean = { false }
+
+    /**
+     * Compile resources in [PatcherConfig.apkFiles].
+     *
+     * @return The [PatcherResult.PatchedResources].
+     */
+    @InternalApi
+    override fun get(): PatcherResult.PatchedResources {
+        val resourcesApkFile = if (config.resourceMode == ResourceMode.FULL) {
+            logger.info("Compiling modified resources")
+            resourceCoder.encodeResources(config.patchedFiles, omitEntry)
+        } else {
+            null
+        }
+
+        // FIXME: All of this stuff is handled by arsclib using metadata files. Clean this up.
+        return PatcherResult.PatchedResources(
+            resourcesApkFile,
+            resourceCoder.getOtherResourceFiles(config.patchedFiles, config.resourceMode),
+            resourceCoder.getUncompressedFiles(config.resourceMode),
+            resourceCoder.getDeletedFiles(config.resourceMode),
+        )
+    }
+
+    /**
+     * Compile resources in [PatcherConfig.apkFiles] and write the patched APK with [dexFiles], as [get]
+     * followed by [app.morphe.patcher.apk.ApkUtils.applyTo] would.
+     *
+     * @param outputApk The file to write the patched APK to.
+     * @param dexFiles The patched DEX files, compressed in the background.
+     * @param timings Where the steps of writing the APK are measured.
+     */
+    internal fun writeApk(outputApk: File, dexFiles: CompressedDexFiles, timings: PhaseTimings) {
+        if (config.resourceMode == ResourceMode.FULL) logger.info("Compiling modified resources")
+        resourceCoder.writeApk(outputApk, config.patchedFiles, config.resourceMode, omitEntry, dexFiles, timings)
+    }
+
+    /**
+     * Get a file from [PatcherConfig.apkFiles].
+     *
+     * A directory only holds the files that were decoded or added so far, so call [decode] before listing it.
+     *
+     * @param path The path of the file.
+     * @param copy Whether to decode the file from [PatcherConfig.apkFile] if it is not decoded yet. Pass false
+     * to replace or add a file without decoding what it replaces. A values file written this way, such as
+     * `res/values-de/strings.xml`, adds its resources to those of the APK or replaces the ones of the same
+     * name, but removes none.
+     */
+    operator fun get(
+        path: String,
+        copy: Boolean = true,
+    ) = resourceCoder.getFile(path, copy = copy)
+
+    /**
+     * List the files of the APK being patched that can be decoded, by the path they are decoded to,
+     * without decoding them. These are the manifest, the resource files under `res/` and the values files
+     * `resources.arsc` is decoded to, such as `res/values-de/strings.xml` and `res/values/public.xml`, and
+     * the other entries of the APK, such as `assets/data.bin`, which are extracted as they are. Native
+     * libraries and DEX files are not listed, but [get] extracts a native library all the same.
+     *
+     * The listing describes the input APK, so it does not reflect files a patch has since added or deleted.
+     *
+     * @param pattern A glob pattern the paths must match. `*` matches any characters within one segment of
+     * a path, `**` matches any characters across segments, and `?` matches one character. A pattern that
+     * matches a directory matches everything below it, so `res/xml` lists the files in that directory.
+     * Lists every file by default.
+     * @param packageName The package whose resources to list. Defaults to the package name of the APK.
+     * @return The matching paths, sorted.
+     */
+    fun listDecodableFiles(pattern: String = "**", packageName: String? = null) =
+        resourceCoder.listDecodableFiles(pattern, packageName)
+
+    /**
+     * Decode the files of the APK being patched that match [patterns] and are not decoded yet, so that a
+     * patch can find them in [PatcherConfig.apkFiles], for example to list a directory.
+     *
+     * A file that was decoded before, or that a patch changed, added or deleted, is left as it is. A values
+     * file a patch wrote before it was decoded is decoded and keeps what the patch wrote, which replaces the
+     * resources of the same name. Calling this when every resource was decoded up front does nothing more.
+     *
+     * ```kt
+     * // Every layout of every configuration.
+     * decode("res/layout*").forEach { path ->
+     *     document(path).use { document -> }
+     * }
+     * ```
+     *
+     * @param patterns Glob patterns the paths must match, see [listDecodableFiles]. `**` decodes everything.
+     * @param packageName The package whose resources to decode. Defaults to the package name of the APK.
+     * @return The paths of the files in [PatcherConfig.apkFiles] matching [patterns], sorted. These include
+     * files patches added, but not the ones they deleted.
+     */
+    fun decode(vararg patterns: String, packageName: String? = null) =
+        resourceCoder.decode(patterns.toList(), packageName)
+
+    /**
+     * List the entries of the APK being patched, without staging them to the working directory.
+     *
+     * Use this to discover what an APK contains, rather than walking the working directory: not
+     * every entry is staged there, and native libraries in particular are left in the archive.
+     * Names are archive names, so they can be passed straight to [get].
+     *
+     * The listing describes the input APK, so it does not reflect files a patch has since added,
+     * changed or deleted.
+     *
+     * @param prefix Restricts the listing to entries starting with it, e.g. `lib/`.
+     */
+    fun listApkEntries(prefix: String = "") = resourceCoder.listApkEntries(prefix)
+
+    /**
+     * Mark a file for deletion when the APK is rebuilt.
+     *
+     * The name is either a decoded resource path such as `res/drawable/icon.png`, or any other
+     * entry of the APK being patched as returned by [listApkEntries], such as
+     * `lib/x86/libfoo.so` or `assets/data.bin`. Archive entries are excluded from the rebuilt APK
+     * staged to the working directory or not, so this works for native
+     * libraries too. A directory name, such as `lib/x86/`, deletes everything below it. Deleting a
+     * name that matches nothing is a no-op. A file deleted and then recreated with [get] keeps the
+     * recreated content. The manifest and `resources.arsc` cannot be deleted.
+     *
+     * @param name The name of the file to delete.
+     * @param packageName The package name a decoded resource exists in. Defaults to the package name of the APK.
+     */
+    @Suppress("unused")
+    fun delete(name: String, packageName: String? = null) = resourceCoder.deleteFile(name, packageName)
+
+    override fun close() {
+        if (ResourceIds.current === resourceIds) ResourceIds.current = null
+        resourceCoder.close()
+    }
+}### Document.kt
+package app.morphe.patcher.util
+
+import app.morphe.patcher.resource.utf8Writer
+import org.w3c.dom.Attr
+import org.w3c.dom.Document
+import org.w3c.dom.DocumentType
+import org.w3c.dom.Element
+import org.w3c.dom.Node
+import org.w3c.dom.ProcessingInstruction
+import java.io.Closeable
+import java.io.File
+import java.io.InputStream
+import java.io.Writer
+import javax.xml.parsers.DocumentBuilderFactory
+
+class Document private constructor(
+    document: Document,
+    private val file: File?,
+) : Document by document, Closeable {
+    init {
+        normalize()
+    }
+
+    internal constructor(inputStream: InputStream) : this(parse(inputStream), null)
+
+    internal constructor(file: File) : this(file.inputStream().buffered().use(::parse), file) {
+        readerCount.merge(file, 1, Int::plus)
+    }
+
+    override fun close() {
+        file?.let {
+            if (readerCount[it]!! > 1) {
+                throw IllegalStateException(
+                    "Two or more instances are currently reading $it." +
+                        "To be able to close this instance, no other instances may be reading $it at the same time.",
+                )
+            } else {
+                readerCount.remove(it)
+            }
+
+            it.utf8Writer().use { writer -> XmlWriter(writer).writeDocument(this) }
+        }
+    }
+
+    private companion object {
+        private val readerCount = mutableMapOf<File, Int>()
+
+        fun parse(inputStream: InputStream): Document =
+            DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(inputStream).apply {
+                documentElement?.resolveAttributeNamespaces(emptyMap())
+            }
+
+        /**
+         * Gives each prefixed attribute the namespace its prefix is declared with, as a namespace aware
+         * parser would, so that the namespace methods such as [Element.setAttributeNS] replace a parsed
+         * attribute instead of adding a second attribute with the same name.
+         *
+         * The parser is not namespace aware, because a namespace aware parser fails on a prefix that is
+         * not declared, and on Android leaves the `xmlns` attributes out of the document.
+         *
+         * @param namespaces The namespace URI each prefix is declared with at the parent element.
+         */
+        private fun Element.resolveAttributeNamespaces(namespaces: Map<String, String>) {
+            val attributeList = (0 until attributes.length).map { attributes.item(it) as Attr }
+
+            var elementNamespaces = namespaces
+            attributeList.filter { it.name.startsWith("xmlns:") }.takeIf { it.isNotEmpty() }?.let { declarations ->
+                elementNamespaces = namespaces + declarations.map { it.name.substring("xmlns:".length) to it.value }
+            }
+
+            if (elementNamespaces.isNotEmpty()) {
+                val namespaceURIs = attributeList.map { attribute ->
+                    val prefix = attribute.name.substringBefore(':', "")
+                    if (prefix == "xmlns") null else elementNamespaces[prefix]
+                }
+
+                // All attributes are added again in their order, which adding only the replaced ones would change.
+                if (namespaceURIs.any { it != null }) {
+                    attributeList.forEach(::removeAttributeNode)
+                    attributeList.forEachIndexed { index, attribute ->
+                        val namespaceURI = namespaceURIs[index]
+                        if (namespaceURI == null) {
+                            setAttributeNode(attribute)
+                        } else {
+                            setAttributeNodeNS(
+                                ownerDocument.createAttributeNS(namespaceURI, attribute.name).also {
+                                    it.value = attribute.value
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+
+            var child = firstChild
+            while (child != null) {
+                if (child is Element) child.resolveAttributeNamespaces(elementNamespaces)
+                child = child.nextSibling
+            }
+        }
+    }
+}
+
+/**
+ * Writes a DOM document as UTF-8 XML.
+ *
+ * This replaces the platform transformer, which on Android checks every character against the output
+ * encoding and takes a lock for every character it writes, and which escapes surrogate pairs to
+ * invalid character references unless it writes UTF-16.
+ *
+ * Namespace declarations missing from the document are added where they are first used, such as for
+ * nodes a patch adds in a namespace the document does not declare.
+ */
+internal class XmlWriter(private val writer: Writer) {
+    /**
+     * The namespace URI each prefix is bound to at the element being written.
+     * The default namespace has the empty prefix.
+     */
+    private val boundNamespaces = mutableMapOf<String, String>()
+
+    fun writeDocument(document: Document) {
+        writer.write("<?xml version=\"1.0\" encoding=\"UTF-8\"")
+        if (document.xmlStandalone) writer.write(" standalone=\"yes\"")
+        writer.write("?>")
+        var child = document.firstChild
+        while (child != null) {
+            writeNode(child)
+            child = child.nextSibling
+        }
+    }
+
+    private fun writeNode(node: Node) {
+        when (node.nodeType) {
+            Node.ELEMENT_NODE -> writeElement(node as Element)
+            Node.TEXT_NODE -> writeEscaped(node.nodeValue, inAttribute = false)
+            Node.CDATA_SECTION_NODE -> {
+                // "]]>" cannot be inside a CDATA section, so it is split into two sections.
+                writer.write("<![CDATA[")
+                writer.write(node.nodeValue.replace("]]>", "]]]]><![CDATA[>"))
+                writer.write("]]>")
+            }
+
+            Node.COMMENT_NODE -> {
+                writer.write("<!--")
+                writer.write(node.nodeValue)
+                writer.write("-->")
+            }
+
+            Node.PROCESSING_INSTRUCTION_NODE -> {
+                val instruction = node as ProcessingInstruction
+                writer.write("<?")
+                writer.write(instruction.target)
+                if (!instruction.data.isNullOrEmpty()) {
+                    writer.write(" ")
+                    writer.write(instruction.data)
+                }
+                writer.write("?>")
+            }
+
+            Node.DOCUMENT_TYPE_NODE -> writeDocumentType(node as DocumentType)
+
+            Node.ENTITY_REFERENCE_NODE -> {
+                writer.write("&")
+                writer.write(node.nodeName)
+                writer.write(";")
+            }
+
+            else -> throw IllegalStateException("Cannot write XML node of type ${node.nodeType}")
+        }
+    }
+
+    private fun writeElement(element: Element) {
+        writer.write("<")
+        writer.write(element.tagName)
+
+        // The previous bindings of the prefixes this element binds, restored when the element ends.
+        val previousBindings = mutableListOf<Pair<String, String?>>()
+        fun bind(prefix: String, namespaceURI: String) {
+            previousBindings += prefix to boundNamespaces.put(prefix, namespaceURI)
+        }
+
+        val attributes = element.attributes
+        for (index in 0 until attributes.length) {
+            val attribute = attributes.item(index) as Attr
+            if (attribute.name == "xmlns") {
+                bind("", attribute.value)
+            } else if (attribute.name.startsWith("xmlns:")) {
+                bind(attribute.name.substring("xmlns:".length), attribute.value)
+            }
+        }
+
+        fun declareIfUnbound(prefix: String?, namespaceURI: String?) {
+            if (namespaceURI == null || prefix == "xml" || namespaceURI == XMLNS_NAMESPACE_URI) return
+            val boundPrefix = prefix.orEmpty()
+            if (boundNamespaces[boundPrefix] == namespaceURI) return
+
+            bind(boundPrefix, namespaceURI)
+            writer.write(if (boundPrefix.isEmpty()) " xmlns=\"" else " xmlns:$boundPrefix=\"")
+            writeEscaped(namespaceURI, inAttribute = true)
+            writer.write("\"")
+        }
+
+        declareIfUnbound(element.prefix, element.namespaceURI)
+        for (index in 0 until attributes.length) {
+            val attribute = attributes.item(index) as Attr
+            // An attribute without a prefix is in no namespace, whatever the default namespace is.
+            if (attribute.prefix != null) declareIfUnbound(attribute.prefix, attribute.namespaceURI)
+        }
+
+        for (index in 0 until attributes.length) {
+            val attribute = attributes.item(index) as Attr
+            writer.write(" ")
+            writer.write(attribute.name)
+            writer.write("=\"")
+            writeEscaped(attribute.value, inAttribute = true)
+            writer.write("\"")
+        }
+
+        var child = element.firstChild
+        if (child == null) {
+            writer.write("/>")
+        } else {
+            writer.write(">")
+            while (child != null) {
+                writeNode(child)
+                child = child.nextSibling
+            }
+            writer.write("</")
+            writer.write(element.tagName)
+            writer.write(">")
+        }
+
+        for ((prefix, namespaceURI) in previousBindings.asReversed()) {
+            if (namespaceURI == null) boundNamespaces.remove(prefix) else boundNamespaces[prefix] = namespaceURI
+        }
+    }
+
+    private fun writeDocumentType(documentType: DocumentType) {
+        writer.write("<!DOCTYPE ")
+        writer.write(documentType.name)
+        val publicId = documentType.publicId
+        val systemId = documentType.systemId
+        if (!publicId.isNullOrEmpty()) {
+            writer.write(" PUBLIC \"$publicId\" \"${systemId.orEmpty()}\"")
+        } else if (!systemId.isNullOrEmpty()) {
+            writer.write(" SYSTEM \"$systemId\"")
+        }
+        if (!documentType.internalSubset.isNullOrEmpty()) {
+            writer.write(" [")
+            writer.write(documentType.internalSubset)
+            writer.write("]")
+        }
+        writer.write(">")
+    }
+
+    /**
+     * Writes [text] with the characters escaped that XML requires, writing the runs between them at once.
+     * In an attribute, white space other than a space is also escaped, which a parser would otherwise
+     * normalize to a space.
+     */
+    private fun writeEscaped(text: String, inAttribute: Boolean) {
+        var runStart = 0
+        for (index in text.indices) {
+            val replacement = when (text[index]) {
+                '&' -> "&amp;"
+                '<' -> "&lt;"
+                '>' -> "&gt;"
+                '"' -> if (inAttribute) "&quot;" else null
+                '\n' -> if (inAttribute) "&#10;" else null
+                '\t' -> if (inAttribute) "&#9;" else null
+                '\r' -> "&#13;"
+                else -> null
+            } ?: continue
+
+            if (index > runStart) writer.write(text, runStart, index - runStart)
+            writer.write(replacement)
+            runStart = index + 1
+        }
+        if (runStart < text.length) writer.write(text, runStart, text.length - runStart)
+    }
+
+    private companion object {
+        private const val XMLNS_NAMESPACE_URI = "http://www.w3.org/2000/xmlns/"
+    }
+}
+### real manifest edits
+## /tmp/mp-patches/patches/src/main/kotlin/app/morphe/patches/music/interaction/jam/JamPatch.kt
+/*
+ * Copyright 2026 Morphe.
+ * https://github.com/MorpheApp/morphe-patches/pull/3014
+ *
+ * See the included NOTICE file for GPLv3 Section 7 terms that apply to this code.
+ */
+
+package app.morphe.patches.music.interaction.jam
+
+import app.morphe.patcher.extensions.InstructionExtensions.addInstructions
+import app.morphe.patcher.extensions.InstructionExtensions.getInstruction
+import app.morphe.patcher.patch.bytecodePatch
+import app.morphe.patcher.patch.resourcePatch
+import app.morphe.patches.music.misc.extension.sharedExtensionPatch
+import app.morphe.patches.music.misc.playservice.versionCheckPatch
+import app.morphe.patches.music.misc.settings.PreferenceScreen
+import app.morphe.patches.music.misc.settings.settingsPatch
+import app.morphe.patches.music.shared.Constants.COMPATIBILITY_YOUTUBE_MUSIC
+import app.morphe.patches.music.shared.MusicActivityOnCreateFingerprint
+import app.morphe.patches.music.video.information.musicVideoInformationPatch
+import app.morphe.patches.shared.misc.settings.preference.NonInteractivePreference
+import app.morphe.patches.shared.misc.settings.preference.PreferenceScreenPreference
+import app.morphe.patches.shared.misc.settings.preference.SwitchPreference
+import app.morphe.util.findElementByAttributeValueOrThrow
+import com.android.tools.smali.dexlib2.iface.instruction.OneRegisterInstruction
+
+private const val EXTENSION_CLASS = "Lapp/morphe/extension/music/patches/jam/JamUI;"
+private const val EXTENSION_BAR_CLASS = "Lapp/morphe/extension/music/patches/jam/JamBar;"
+
+private val jamResources = resourcePatch {
+    dependsOn(versionCheckPatch)
+    execute {
+        document("AndroidManifest.xml").use { doc ->
+            val permissions = doc.getElementsByTagName("uses-permission")
+            if (
+                (0 until permissions.length).none {
+                    (permissions.item(it) as org.w3c.dom.Element).getAttribute("android:name") ==
+                        "android.permission.ACCESS_WIFI_STATE"
+                }
+            ) {
+                doc.documentElement.appendChild(
+                    doc.createElement("uses-permission").apply {
+                        setAttribute("android:name", "android.permission.ACCESS_WIFI_STATE")
+                    }
+                )
+            }
+            val service = doc.createElement("service")
+            service.setAttribute("android:name", "app.morphe.extension.music.patches.jam.JamBridgeService")
+            service.setAttribute("android:exported", "true")
+            doc.getElementsByTagName("application").item(0).appendChild(service)
+            val queries =
+                doc.getElementsByTagName("queries").item(0)
+                    ?: doc.createElement("queries").also { doc.documentElement.appendChild(it) }
+            queries.appendChild(
+                doc.createElement("package").apply {
+                    setAttribute("android:name", "app.morphe.jam.companion")
+                }
+            )
+        }
+
+        document("res/layout/player_bottom_sheet.xml").use { doc ->
+            val root = doc.documentElement
+            val tabs =
+                root.childNodes.findElementByAttributeValueOrThrow(
+                    "android:id",
+                    "@id/bottom_sheet_tabbed_view",
+                )
+            root.insertBefore(
+                doc.createElement("app.morphe.extension.music.patches.jam.JamBar").apply {
+                    setAttribute("android:layout_width", "match_parent")
+                    setAttribute("android:layout_height", "48dp")
+                },
+                tabs,
+            )
+        }
+    }
+}
+
+/**
+ * Connects semantic YouTube Music anchors to the stable Jam extension API. Native discovery is kept
+ * in [JamQueueAbi] and [JamUiAbi]; generated methods are small access or interception bridges.
+ */
+@Suppress("unused")
+val jamQueueSharingPatch = bytecodePatch(
+    name = "Jam queue sharing",
+    description = "Shares the host queue and playback controls through an authenticated Jam bridge. "
+            + "Root installation is not supported."
+) {
+    dependsOn(
+        sharedExtensionPatch,
+        settingsPatch,
+        jamResources,
+        musicVideoInformationPatch,
+        versionCheckPatch,
+    )
+    compatibleWith(COMPATIBILITY_YOUTUBE_MUSIC)
+
+    execute {
+        val baseQueue = resolveJamQueueAbi()
+        val ui = resolveJamUiAbi(baseQueue)
+        val queue = baseQueue.copy(item = baseQueue.item.copy(menuPayload = ui.queueRow.menuPayload))
+
+        installJamQueueBridges(queue)
+        installJamUiBridges(ui, queue)
+
+        MusicActivityOnCreateFingerprint.method.addInstructions(
+            0,
+            "invoke-static/range {p0 .. p0}, $EXTENSION_CLASS->install(Landroid/app/Activity;)V",
+        )
+
+        BottomSheetPeekHeightFingerprint.let {
+            it.method.apply {
+                val index = it.instructionMatches.last().index
+                val register = getInstruction<OneRegisterInstruction>(index).registerA
+
+                addInstructions(
+                    index + 1,
+                    """
+                        invoke-static { p0, v$register }, $EXTENSION_BAR_CLASS->getBottomSheetPeekHeight(Landroid/view/View;I)I
+                        move-result v$register
+## /tmp/mp-patches/patches/src/main/kotlin/app/morphe/patches/music/interaction/downloads/DownloadsPatch.kt
+/*
+ * Copyright 2026 Morphe.
+ * https://github.com/MorpheApp/morphe-patches/pull/1881
+ *
+ * See the included NOTICE file for GPLv3 Section 7 terms that apply to Morphe contributions.
+ */
+
+package app.morphe.patches.music.interaction.downloads
+
+import app.morphe.patcher.extensions.InstructionExtensions.addInstructionsWithLabels
+import app.morphe.patcher.patch.bytecodePatch
+import app.morphe.patcher.patch.resourcePatch
+import app.morphe.patcher.util.cloneParameters
+import app.morphe.patches.music.misc.settings.PreferenceScreen
+import app.morphe.patches.music.misc.settings.settingsPatch
+import app.morphe.patches.music.shared.Constants.COMPATIBILITY_YOUTUBE_MUSIC
+import app.morphe.patches.music.video.information.musicVideoInformationPatch
+import app.morphe.patches.shared.misc.settings.preference.ListPreference
+import app.morphe.patches.shared.misc.settings.preference.PreferenceScreenPreference
+import app.morphe.patches.shared.misc.settings.preference.PreferenceScreenPreference.Sorting
+import app.morphe.patches.shared.misc.settings.preference.SwitchPreference
+import app.morphe.patches.shared.misc.settings.preference.TextPreference
+import app.morphe.patches.shared.misc.textcomponent.hookSpannableString
+import app.morphe.patches.shared.misc.textcomponent.textComponentPatch
+import app.morphe.util.addInstructionsAtControlFlowLabel
+import com.android.tools.smali.dexlib2.iface.instruction.FiveRegisterInstruction
+
+private val OFFLINE_PLAYBACK_PERMISSIONS = listOf(
+    "android.permission.WAKE_LOCK",
+    "android.permission.FOREGROUND_SERVICE",
+    "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+    "android.permission.POST_NOTIFICATIONS",
+)
+
+private const val OFFLINE_PLAYBACK_SERVICE =
+    "app.morphe.extension.music.patches.downloads.OfflinePlaybackService"
+
+private val downloadsResourcePatch = resourcePatch {
+    dependsOn(settingsPatch)
+
+    execute {
+        PreferenceScreen.PLAYER.addPreferences(
+            PreferenceScreenPreference(
+                key = "morphe_external_downloader_screen",
+                sorting = Sorting.UNSORTED,
+                preferences = setOf(
+                    ListPreference("morphe_download_mode"),
+                    SwitchPreference("morphe_external_downloader_menu", summary = true),
+                    TextPreference(
+                        "morphe_external_downloader_name",
+                        tag = "app.morphe.extension.shared.settings.preference.ExternalDownloaderPreference"
+                    )
+                )
+            )
+        )
+
+        val manifest = get("AndroidManifest.xml")
+        var xml = manifest.readText()
+
+        // YouTube Music already declares most of these, so each one is added only when missing.
+        // The whole attribute is matched, since FOREGROUND_SERVICE is a prefix of
+        // FOREGROUND_SERVICE_MEDIA_PLAYBACK and would otherwise look like it is already there.
+        for (permission in OFFLINE_PLAYBACK_PERMISSIONS) {
+            val declaration = "android:name=\"$permission\""
+            if (!xml.contains(declaration)) {
+                xml = xml.replace(
+                    "<application",
+                    "<uses-permission $declaration />\n    <application"
+                )
+            }
+        }
+
+        if (!xml.contains(OFFLINE_PLAYBACK_SERVICE)) {
+            xml = xml.replace(
+                "</application>",
+                "<service android:name=\"$OFFLINE_PLAYBACK_SERVICE\" " +
+                    "android:exported=\"false\" android:foregroundServiceType=\"mediaPlayback\" />\n</application>"
+            )
+        }
+
+        manifest.writeText(xml)
+    }
+}
+
+private const val EXTENSION_CLASS = "Lapp/morphe/extension/music/patches/DownloadsPatch;"
+private const val EXTENSION_PROTOCOL_BUFFER_INTERFACE =
+    $$"Lapp/morphe/extension/music/patches/DownloadsPatch$ProtocolBufferFieldInterface;"
+
+
+@Suppress("unused")
+val downloadsPatch = bytecodePatch(
+    name = "Downloads",
+    description = "Adds support to download songs using the in-app download button, " +
+        "either with an external downloader app or inside YouTube Music.",
+) {
+    dependsOn(
+        downloadsResourcePatch,
+        settingsPatch,
+        textComponentPatch,
+        musicVideoInformationPatch
+    )
+
+    compatibleWith(COMPATIBILITY_YOUTUBE_MUSIC)
+
+    execute {
+        hookSpannableString(EXTENSION_CLASS)
+
+        val (_, downloadCall) = OfflineVideoEndpointFingerprint.instructionMatches
+
+        CommandResolverFingerprint.method.cloneParameters().apply {
+            // Add interface to get buffer.
+            mutableClassDefBy(parameterTypes[1].toString())
+                .interfaces.add(EXTENSION_PROTOCOL_BUFFER_INTERFACE)
+
+            addInstructionsWithLabels(
+                0,
+                """
+                    invoke-static { p1, p2 }, $EXTENSION_CLASS->commandResolverOnClick(${EXTENSION_PROTOCOL_BUFFER_INTERFACE}Ljava/util/Map;)Z
+                    move-result v0
+                    if-eqz v0, :continue_resolution
+## /tmp/mp-patches/patches/src/main/kotlin/app/morphe/patches/all/misc/debugging/EnableAndroidDebuggingPatch.kt
+package app.morphe.patches.all.misc.debugging
+
+import app.morphe.patcher.patch.resourcePatch
+import org.w3c.dom.Element
+
+@Suppress("unused")
+internal val enableAndroidDebuggingPatch = resourcePatch(
+    // name = "Enable Android debugging",
+    description = "Enables Android developer debugging capabilities. Including this patch can slow down the app.",
+    default = true
+) {
+    execute {
+        document("AndroidManifest.xml").use { document ->
+            val applicationNode =
+                document
+                    .getElementsByTagName("application")
+                    .item(0) as Element
+
+            // set application as debuggable
+            applicationNode.setAttribute("android:debuggable", "true")
+        }
+    }
+}
+## /tmp/mp-patches/patches/src/main/kotlin/app/morphe/patches/all/misc/network/OverrideCertificatePinningPatch.kt
+/*
+ * Copyright 2026 Morphe.
+ * https://github.com/MorpheApp/morphe-patches
+ *
+ * Original code hard forked from:
+ * https://github.com/inotia00/revanced-patches/blob/54ce1d4808b12903602a1a0d9a721ee835093c38/patches/src/main/kotlin/app/revanced/patches/all/misc/network/OverrideCertificatePinningPatch.kt#L4
+ *
+ * File-Specific License Notice (GPLv3 Section 7 Terms)
+ *
+ * This file is part of the Morphe project and is licensed under
+ * the GNU General Public License version 3 (GPLv3), with the Additional
+ * Terms under Section 7 described in the LICENSE file.
+ *
+ * https://www.gnu.org/licenses/gpl-3.0.html
+ *
+ * Section 7b: Notice Preservation
+ * -------------------------------
+ * This entire comment block must be preserved in all copies,
+ * distributions, and derivative works of this file, in both
+ * original and modified source forms.
+ *
+ * Portions of this software are provided "AS IS" by the Morphe software project.
+ * Any express or implied warranties, including the implied warranties of
+ * merchantability and fitness for a particular purpose, are disclaimed.
+ */
+
+package app.morphe.patches.all.misc.network
+
+import app.morphe.patcher.patch.resourcePatch
+import app.morphe.util.adoptChild
+import app.morphe.util.getNode
+import app.morphe.util.trimIndentMultiline
+import org.w3c.dom.Element
+import java.io.File
+
+private const val NETWORK_SECURITY_CONFIG_ATTRIBUTE_NAME = "android:networkSecurityConfig"
+
+@Suppress("unused")
+val overrideCertificatePinningPatch = resourcePatch(
+    name = "Override certificate pinning",
+    description = "Overrides certificate pinning, allowing to inspect traffic via a proxy.",
+    default = false
+) {
+    execute {
+        val resXmlDirectory = get("res/xml")
+        var networkSecurityFileName = "network_security_config.xml"
+
+        // Add android:networkSecurityConfig="@xml/network_security_config"
+        // and the "networkSecurityConfig" attribute if it does not exist.
+        document("AndroidManifest.xml").use { document ->
+            val applicationNode = document.getElementsByTagName("application").item(0) as Element
+
+            if (applicationNode.hasAttribute(NETWORK_SECURITY_CONFIG_ATTRIBUTE_NAME)) {
+                networkSecurityFileName =
+                    applicationNode.getAttribute(NETWORK_SECURITY_CONFIG_ATTRIBUTE_NAME)
+                        .split("/")[1] + ".xml"
+            } else {
+                document.createAttribute(NETWORK_SECURITY_CONFIG_ATTRIBUTE_NAME)
+                    .apply { value = "@xml/network_security_config" }
+                    .let(applicationNode.attributes::setNamedItem)
+            }
+        }
+
+        if (get("res/xml/$networkSecurityFileName").exists()) {
+            document("res/xml/$networkSecurityFileName").use { document ->
+                arrayOf(
+                    "base-config",
+                    "debug-overrides"
+                ).forEach { tagName ->
+                    val configElement = document.getNode(tagName) as? Element ?: tagName.let {
+                        document.getNode("network-security-config").adoptChild(tagName) {
+                            if (tagName == "base-config") {
+                                setAttribute("cleartextTrafficPermitted", "true")
+                            }
+                        }
+                        document.getNode(tagName)
+                    }
+                    val configChildNodes = configElement.childNodes
+                    for (i in 0 until configChildNodes.length) {
+                        val anchorNode = configChildNodes.item(i)
+                        if (anchorNode is Element && anchorNode.tagName == "trust-anchors") {
+                            var injected = false
+                            val certificatesChildNodes = anchorNode.childNodes
+                            for (i in 0 until certificatesChildNodes.length) {
+                                val node = certificatesChildNodes.item(i)
+                                if (node is Element && node.tagName == "certificates") {
+                                    if (node.hasAttribute("src") && node.getAttribute("src") == "user") {
+                                        node.setAttribute("overridePins", "true")
+                                        injected = true
+                                    }
+                                }
+                            }
+                            if (!injected) {
+                                anchorNode.adoptChild("certificates") {
+                                    setAttribute("src", "user")
+                                    setAttribute("overridePins", "true")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // In case the file does not exist create the "network_security_config.xml" file.
+            File(resXmlDirectory, networkSecurityFileName).apply {
+                writeText(
+                    """
+                    <?xml version="1.0" encoding="utf-8"?>
+                    <network-security-config>
+                        <base-config cleartextTrafficPermitted="true">
+                            <trust-anchors>
+                                <certificates src="system" />
+                                <certificates
+                                    src="user"
+                                    overridePins="true" />
+                            </trust-anchors>
+                        </base-config>
+                        <debug-overrides>
+                            <trust-anchors>
+                                <certificates src="system" />
+## /tmp/mp-patches/patches/src/main/kotlin/app/morphe/patches/all/misc/updates/DisablePlayStoreUpdatesPatch.kt
+/*
+ * Copyright 2026 Morphe.
+ * https://github.com/MorpheApp/morphe-patches/pull/2470
+ *
+ * Original code hard forked from:
+ * https://github.com/ReVanced/revanced-patches/blob/724e6d61b2ecd868c1a9a37d465a688e83a74799/patches/src/main/kotlin/app/revanced/patches/all/misc/versioncode/ChangeVersionCodePatch.kt
+ *
+ * File-Specific License Notice (GPLv3 Section 7 Terms)
+ *
+ * This file is part of the Morphe project and is licensed under
+ * the GNU General Public License version 3 (GPLv3), with the Additional
+ * Terms under Section 7 described in the LICENSE file.
+ *
+ * https://www.gnu.org/licenses/gpl-3.0.html
+ *
+ * Section 7b: Notice Preservation
+ * -------------------------------
+ * This entire comment block must be preserved in all copies,
+ * distributions, and derivative works of this file, in both
+ * original and modified source forms.
+ *
+ * Portions of this software are provided "AS IS" by the Morphe software project.
+ * Any express or implied warranties, including the implied warranties of
+ * merchantability and fitness for a particular purpose, are disclaimed.
+ */
+
+package app.morphe.patches.all.misc.updates
+
+import app.morphe.patcher.Fingerprint
+import app.morphe.patcher.extensions.InstructionExtensions.addInstruction
+import app.morphe.patcher.extensions.InstructionExtensions.getInstruction
+import app.morphe.patcher.extensions.InstructionExtensions.replaceInstruction
+import app.morphe.patcher.fieldAccess
+import app.morphe.patcher.methodCall
+import app.morphe.patcher.patch.bytecodePatch
+import app.morphe.patcher.patch.resourcePatch
+import app.morphe.patcher.util.getFreeRegisterProvider
+import app.morphe.patcher.util.matchAllMethodIndicesForEach
+import app.morphe.patcher.util.returnEarly
+import app.morphe.util.getNode
+import com.android.tools.smali.dexlib2.Opcode
+import com.android.tools.smali.dexlib2.iface.instruction.FiveRegisterInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.TwoRegisterInstruction
+import org.w3c.dom.Element
+import java.util.logging.Logger
+
+private const val EXTENSION_CLASS = "Lapp/morphe/extension/all/versioncode/DisablePlayStoreUpdatesPatch;"
+
+private var originalVersionCode: Int = 0
+
+@Suppress("unused")
+private val disablePlayStoreUpdatesResourcePatch = resourcePatch {
+    execute {
+        document("AndroidManifest.xml").use { document ->
+            val manifest = document.getNode("manifest") as Element
+
+            originalVersionCode = manifest.getAttribute("android:versionCode").toInt()
+        }
+    }
+
+    finalize {
+        document("AndroidManifest.xml").use { document ->
+            val manifest = document.getNode("manifest") as Element
+
+            //  Max allowed by Play Store is 2100000000, but Android allows max int value.
+            manifest.setAttribute("android:versionCode", Int.MAX_VALUE.toString())
+        }
+    }
+}
+
+@Suppress("unused")
+internal val disablePlayStoreUpdatesPatch = bytecodePatch(
+    name = "Disable Play Store updates",
+    description = "Disables Play Store updates by setting the version code to the maximum allowed. " +
+            "This patch may cause unexpected issues with some apps and does not work if the " +
+            "app is installed by root mounting",
+    default = false
+) {
+
+    dependsOn(disablePlayStoreUpdatesResourcePatch)
+
+    extendWith("extensions/all/versioncode/change-version-code.mpe")
+
+    finalize {
+        Fingerprint(
+            definingClass = EXTENSION_CLASS,
+            name = "originalVersionCode"
+        ).method.returnEarly(originalVersionCode)
+
+        val logger by lazy { Logger.getLogger(this::class.java.name) }
+
+        Fingerprint(
+            filters = listOf(
+                fieldAccess(
+                    opcode = Opcode.IGET,
+                    smali = "Landroid/content/pm/PackageInfo;->versionCode:I"
+                )
+            ),
+            custom = { _, classDef ->
+                !classDef.type.startsWith("Lapp/morphe/extension")
+            }
+        ).matchAllMethodIndicesForEach(requireMatches = false) { index ->
+            val instruction = this.getInstruction<TwoRegisterInstruction>(index)
+            val moveResultRegister = instruction.registerA
+            val packageInfoRegister = instruction.registerB
+            val moveResultIndex = index + 1
+
+            if (moveResultRegister >= 16) {
+                val provider = getFreeRegisterProvider(
+                    moveResultIndex,
+                    moveResultRegister,
+                    packageInfoRegister
+                )
+                if (!provider.hasFreeRegisters()) {
+                    logger.warning("Method does not have enough free registers, version code may not be overridden for: $this")
+                    return@matchAllMethodIndicesForEach
+                }
+                val free = provider.getFreeRegister()
+                if (free >= 16) {
+                    logger.warning("No 4-bit register available, version code may not be overridden for: $this")
+### plugin/lib versions
+# Dependencies must also be addded to LicensesDialog.java
+
+[versions]
+morphe-patcher = "2.0.0"
+morphe-patches-library = "2.1.0-dev.2"
+smali = "4220ae75f7"
+agp = "9.1.0"
+annotation = "1.11.0"
+androidx-core = "1.18.0"    # 1.19.0+ requires upgrading android compile sdk
+androidx-javascriptengine = "1.1.1"
+collections4 = "4.6.0"
+gson = "2.15.0"
+guava = "33.6.0-jre"
+hiddenapi = "6.1"
+protobuf = "0.10.0"
+protoc = "4.36.2"
+junit = "4.13.2"
+junit-jupiter = "6.1.3"
+kotlinx-coroutines = "1.11.0"
+
+[libraries]
+morphe-patches-library = { module = "app.morphe:morphe-patches-library", version.ref = "morphe-patches-library" }
+morphe-extensions-library = { module = "app.morphe:morphe-extensions-library", version.ref = "morphe-patches-library" }
+annotation = { module = "androidx.annotation:annotation", version.ref = "annotation" }
+androidx-core = { module = "androidx.core:core", version.ref = "androidx-core" }
+androidx-javascriptengine = { module = "androidx.javascriptengine:javascriptengine", version.ref = "androidx-javascriptengine" }
+collections4 = { module = "org.apache.commons:commons-collections4", version.ref = "collections4" }
+gson = { module = "com.google.code.gson:gson", version.ref = "gson" }
+guava = { module = "com.google.guava:guava", version.ref = "guava" }
+hiddenapi = { module = "org.lsposed.hiddenapibypass:hiddenapibypass", version.ref = "hiddenapi" }

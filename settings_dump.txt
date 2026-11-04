@@ -1,3 +1,0 @@
-### decoded dirs found
-/Users/stephenflorian/Desktop/RiF golden platinum/apktool.yml
-/Users/stephenflorian/Downloads/messages_resources/apktool.yml

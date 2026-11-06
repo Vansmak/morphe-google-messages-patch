@@ -11,7 +11,10 @@ object Constants {
         apkFileType = ApkFileType.APK,
         appIconColor = 0x1A73E8,
         targets = listOf(
-            AppTarget(version = "messages.android_20261020_00_RC01.phone_dynamic")
+            AppTarget(version = "messages.android_20261020_00_RC01.phone_dynamic"),
+            // Samsung flavor from Play (what a Galaxy phone installs). Same obfuscated
+            // classes and methods as RC01 for everything this patch touches.
+            AppTarget(version = "messages.android_20261020_00_RC00.phone_samsung_dynamic")
         )
     )
 }

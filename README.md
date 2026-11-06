@@ -19,7 +19,7 @@ Click the button below, or manually add this repo url to Morphe Manager: https:/
 ## 🩹 Patches list
 
 <!-- PATCHES_START EXPANDED -->
-> **[v1.0.0](https://github.com/coloradude/morphe-google-messages-patch/releases/tag/v1.0.0)**&nbsp;&nbsp;•&nbsp;&nbsp;`main`&nbsp;&nbsp;•&nbsp;&nbsp;1 patches total
+> **[v1.0.0](https://github.com/Vansmak/morphe-google-messages-patch/releases/tag/v1.0.0)**&nbsp;&nbsp;•&nbsp;&nbsp;`main`&nbsp;&nbsp;•&nbsp;&nbsp;1 patches total
 <details open>
 <summary>📦 Google Messages&nbsp;&nbsp;•&nbsp;&nbsp;1 patch</summary>
 <br>
@@ -28,8 +28,8 @@ Click the button below, or manually add this repo url to Morphe Manager: https:/
 
 **🎯 Supported versions:**
 
-| messages.android_20261020_00_RC01.phone_dynamic |
-| :---: |
+| messages.android_20261020_00_RC01.phone_dynamic | messages.android_20261020_00_RC00.phone_samsung_dynamic |
+| :---: | :---: |
 
 | 💊&nbsp;Patch | 📜&nbsp;Description | ⚙️&nbsp;Options |
 |----------|----------------|-----------|
